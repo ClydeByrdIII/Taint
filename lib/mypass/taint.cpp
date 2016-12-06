@@ -17,7 +17,7 @@ struct source {
     int argc;
 };
 
-struct source srcs[] = 
+struct source srcs[] =
 {
     {"getchar", 0},
     {"read", 2},
@@ -37,7 +37,7 @@ struct source srcs[] =
     {"recvfrom", 2},
 };
 
-struct source sinks[] = 
+struct source sinks[] =
 {
     {"strcpy", 2},
     {"strncpy", 2},
@@ -85,11 +85,21 @@ namespace {
             for (CallGraph::iterator i = CG->begin(), ie = CG->end(); i != ie; i++) {
                 Function *func = const_cast<Function *>(i->first);
                 
+                
                 // only work on source code
                 if (!func || func->isDeclaration())
                     continue;
-                
+
                 std::string name(func->getName().str());
+
+                // arguments 
+                for (Function::arg_iterator args = func->arg_begin(), argse = func->arg_end(); args != argse; args++) {
+                    Value *inst = dyn_cast<Value>(args);
+                    if (inst) {
+                        addToSources(*inst, name);
+                    }
+                }
+
 
                 funcMap[name] = func;
                 funcTP.push_back(func);
@@ -102,17 +112,16 @@ namespace {
            
             // get reverse topological order
             funcRTP.insert(funcRTP.begin(), funcTP.begin(), funcTP.end());
-            
             std::reverse(funcRTP.begin(), funcRTP.end());
             
             for (std::vector<Function *>::iterator l = funcRTP.begin(), le = funcRTP.end(); l != le; l++) {
                 // find path from l's srcs to l's sinks
                 std::string fname = (*l)->getName().str();
-                for (std::vector<Instruction *>::iterator I = funcSrcs[fname].begin(), IE = funcSrcs[fname].end(); I != IE; I++ ) {
+                for (std::vector<Value *>::iterator I = funcSrcs[fname].begin(), IE = funcSrcs[fname].end(); I != IE; I++ ) {
                     errs() << fname << " has " << **I << " as a source\n";
-                    // find path to sinks 
-                    taintTrack(**I);
+ 
                 }
+
             }
 
             return false; // return true if you modified the code
@@ -130,23 +139,22 @@ namespace {
         
         bool isSink(std::string str);
         bool isSource(std::string str);
-        void addToSources(Instruction &I);
-        void addToSinks(Instruction &I);
+        void addToSources(Value &I, std::string name);
+        void addToSinks(Value &I, std::string name);
 
         std::string get_function_name(CallInst *call);
         int isSourceOperand(std::string str); 
-        bool sinkSearch(Instruction * I);
+        bool sinkSearch(Value * I, std::string fname);
 
         private:
             std::map<Instruction *, std::vector<Value *> > taintMap;
             std::queue<Instruction *> taintedQueue;
             std::vector<Instruction *> taintedInstructions;
             std::map<std::string, Function *> funcMap;
-            std::map<std::string, std::vector<Instruction *> > funcArgs;
             std::vector<Function *> funcRTP;
             std::vector<Function *> funcTP;
-            std::map<std::string, std::vector<Instruction *> > funcSrcs;
-            std::map<std::string, std::vector<Instruction *> > funcSinks;
+            std::map<std::string, std::vector<Value *> > funcSrcs;
+            std::map<std::string, std::vector<Value *> > funcSinks;
             std::map<std::string, Function *> taintedFunctions;
             Function *main;
             CallGraph *CG;
@@ -170,12 +178,6 @@ void taint::identifySource(Instruction &I) {
                 if (!dyn_cast<Constant>(first)) {
                     Instruction *var = dyn_cast<Instruction>(first);
                     if (!var) {
-                        // I is an argument of its function
-                        funcArgs[name].push_back(&I);
-                        
-                        // it's also a source
-                        addToSources(I);
-                        errs() << I << " is an argument of fn: " << name << "\n"; 
                         continue;
                     }
                     
@@ -183,11 +185,8 @@ void taint::identifySource(Instruction &I) {
                     CallInst *call = dyn_cast<CallInst>(var);
                     if (call && (isSource(get_function_name(call)) || taintedFunctions[get_function_name(call)] != NULL)) {
                         // untrusted source; I is now tainted
-                        addToSources(I);
-                        taintedInstructions.push_back(&I);
-                        taintMap[&I].push_back(var);
-                        taintedFunctions[get_function_name(call)] = call->getCalledFunction();
-
+                        Value *v = dyn_cast<Value>(&I);
+                        addToSources(*v, name);
                         errs() << I << " was not a constant; was tainted by " << *first << "\n";
                     }
 
@@ -198,13 +197,12 @@ void taint::identifySource(Instruction &I) {
                 CallInst *call = dyn_cast<CallInst>(User);
                 if (call && (isSource(get_function_name(call)) || taintedFunctions[get_function_name(call)] != NULL)) {
                     std::string fn(get_function_name(call));
-                    
+                    errs() << "fn is " << fn << "\n";
                     // if scanf functions any usage of I is tainted 
                     if (!fn.compare("__isoc99_scanf") || !fn.compare("__isoc99_fscanf")) {
-                        addToSources(I);
-                        taintedInstructions.push_back(&I);
-                        taintMap[&I].push_back(User);
-                        taintedFunctions[get_function_name(call)] = call->getCalledFunction();
+                        Value *v = dyn_cast<Value>(&I);
+                        addToSources(*v, name);
+                        
                     } else {
 
                         // check and see if I is being used as a taintable operand in User
@@ -222,10 +220,8 @@ void taint::identifySource(Instruction &I) {
                         }
 
                         if (found == true && pos == argc) {
-                            addToSources(I);           
-                            taintedInstructions.push_back(&I);
-                            taintMap[&I].push_back(User);
-                            taintedFunctions[get_function_name(call)] = call->getCalledFunction(); 
+                             Value *v = dyn_cast<Value>(&I);
+                             addToSources(*v, name);
                         }
 
                     }
@@ -234,7 +230,6 @@ void taint::identifySource(Instruction &I) {
             }
         }
     }   
-    errs() << "END\n"; 
 }
 
 void taint::identifySrcsAndSinks(Function * f) {
@@ -244,7 +239,6 @@ void taint::identifySrcsAndSinks(Function * f) {
         for (BasicBlock::iterator i = b->begin(); i != b->end(); i++) { 
             // find variables that use non-constant values
             if (i->getOpcode() == Instruction::Alloca || i->getOpcode() == Instruction::GetElementPtr) {
-                errs() << i->getOpcodeName() << "\n";
                 identifySource(*i);
             } else if (i->getOpcode() == Instruction::Call || i->getOpcode() == Instruction::Ret || i->getOpcode() == Instruction::Br) {
                 // potentially a sink
@@ -261,7 +255,7 @@ void taint::identifySrcsAndSinks(Function * f) {
                 } else if (br) {
                     errs() << *i << " is a branch instruction\n";
                 }
-                funcSinks[name].push_back(i);
+                addToSinks(*i, name);
             }
         }
     }
@@ -310,53 +304,25 @@ int taint::isSourceOperand(std::string str) {
     return -1;
 }
 
-void taint::addToSources(Instruction &I) {
-    Function *f = I.getParent()->getParent();
-    std::string name = f->getName().str();
+void taint::addToSources(Value &I, std::string name) {
     if (std::find(funcSrcs[name].begin(), funcSrcs[name].end(), &I) == funcSrcs[name].end()) {
         funcSrcs[name].push_back(&I);
     }
 }
 
-void taint::addToSinks(Instruction &I) {
-    Function *f = I.getParent()->getParent();
-    std::string name = f->getName().str();
+void taint::addToSinks(Value &I, std::string name) {
     if (std::find(funcSinks[name].begin(), funcSinks[name].end(), &I) == funcSinks[name].end()) {
         funcSinks[name].push_back(&I);
     }
 }
 
-void taint::taintTrack(Instruction &I) {
-    std::vector<Instruction *> taint;
-    std::queue<Instruction *> tq;
-    size_t tainted_vars = 0;
-    taint.push_back(&I);
-    tq.push(&I);
-    while(!tq.empty()) {
-        Instruction *node = tq.front();
-        tq.pop();
-        // enqueue all children
-        
-        for(Value::use_iterator UI = node->use_begin(), E = node->use_end(); UI != E; ++UI) {
-            Instruction *user = dyn_cast<Instruction>(*UI);
-            tq.push(user);
-        }
-        
-        // analyze node 
-        if(sinkSearch(node)) {
-            // we found a sink
-            errs() << I << " has a path to " << *node << "\n";
-        }        
-    }
-}
 
-bool taint::sinkSearch(Instruction *I) {
-    std::string fname = I->getParent()->getParent()->getName().str();
+// return true if I is a sink
+bool taint::sinkSearch(Value *I, std::string fname) {
 
-    for (std::vector<Instruction*>::iterator s = funcSinks[fname].begin(), se = funcSinks[fname].end(); s != se; s++) {
+    for (std::vector<Value*>::iterator s = funcSinks[fname].begin(), se = funcSinks[fname].end(); s != se; s++) {
         if (I == *s)
             return true;
     }
-
     return false;
 }
