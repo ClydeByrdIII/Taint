@@ -11,6 +11,13 @@
 #include <set>
 #include <algorithm>
 
+
+#ifdef D
+#define PRINT(x) llvm::errs() << x
+#else
+#define PRINT(x)
+#endif
+
 #define UNTAINT
 // #define ALLSOURCE
 
@@ -81,7 +88,7 @@ namespace {
             numPaths = 0;
             /* TODO: ADD global instructions in to the analaysis */
             for (Module::global_iterator glob = M.global_begin(), globe = M.global_end(); glob != globe; glob++ ) {
-                errs() << "Global instruction: " << *glob << "\n";
+                PRINT("Global instruction: " << *glob << "\n");
             }
 
             CG = &getAnalysis<CallGraph>();
@@ -108,9 +115,6 @@ namespace {
 
                 funcMap[name] = func;
                 funcTP.push_back(func);
-                
-                if(!main && !name.compare("main")) 
-                    main = func;
 
                 identifySrcsAndSinks(func);
             }
@@ -123,7 +127,7 @@ namespace {
                 // find path from l's srcs to l's sinks
                 std::string fname = (*l)->getName().str();
                 for (std::vector<Value *>::iterator I = funcSrcs[fname].begin(), IE = funcSrcs[fname].end(); I != IE; I++ ) {
-                    errs() << fname << " has " << **I << " as a source\n";
+                    PRINT(fname << " has " << **I << " as a source\n");
                     Instruction *v = dyn_cast<Instruction>(*I);
                     if (v)
                         taintTrack(*v);
@@ -132,8 +136,8 @@ namespace {
 
             }
 		// Count Insts that propagate taint
-		llvm::errs()<< "# Tainting Instructions = " << taintedInstructions.size() << "\n";
-        llvm::errs()<< "# of Paths = " << numPaths << "\n";
+		llvm::errs() << "# Tainting Instructions = " << taintedInstructions.size() << "\n";
+        llvm::errs() << "# of Paths = " << numPaths << "\n";
 		
             return false; // return true if you modified the code
         }
@@ -158,96 +162,123 @@ namespace {
         bool sinkSearch(Value * I, std::string fname);
 
         private:
-            std::map<Instruction *, std::vector<Value *> > taintMap;
-            std::queue<Instruction *> taintedQueue;
-            std::set<Instruction *> taintedInstructions;
             size_t numPaths;
+            CallGraph *CG;  // shows topological ordering of functions
+            std::vector<Function *> funcTP;  // topological ordering of functions; used to reverse ordering
+            std::vector<Function *> funcRTP; // reverse topological ordering of functions
             std::map<std::string, Function *> funcMap;
-            std::vector<Function *> funcRTP;
-            std::vector<Function *> funcTP;
+            std::set<Instruction *> taintedInstructions;
             std::map<std::string, std::vector<Value *> > funcSrcs;
             std::map<std::string, std::vector<Value *> > funcSinks;
-            std::map<std::string, Function *> taintedFunctions;
-            Function *main;
-            CallGraph *CG;
 
     };
 }
 char taint::ID = 0;
 static RegisterPass<taint> X("taint", "Static Taint Analysis", false, false);
 
+// If an instance of I being tainted is found, add it to sources and return
+
 void taint::identifySource(Instruction &I) {
 
+    bool foundSource = false;
     Function *f = I.getParent()->getParent();
     std::string name = f->getName().str();
-    // look for the values being stored in to a variable
-    for(Value::use_iterator UI = I.use_begin(), E = I.use_end(); UI != E; ++UI) {
-        Instruction *User = dyn_cast<Instruction>(*UI);
-        if(User) {
-            if (User->getOpcode() == Instruction::Store) {
-                Value *first = User->getOperand(0);
-                // if it's not a constant it's probably used as a source of input
-                if (!dyn_cast<Constant>(first)) {
-                    Instruction *var = dyn_cast<Instruction>(first);
-                    if (!var) {
-                        continue;
-                    }
-                    
-                    #ifdef ALLSOURCE
-                        Value *v = dyn_cast<Value>(&I);
-                        addToSources(*v, name);
-                        continue;
-                    #endif
 
-                    // if the the value of a call is being stored see if it's from untrusted sources
-                    CallInst *call = dyn_cast<CallInst>(var);
-                    if (call && (isSource(get_function_name(call)))) {
-                        // untrusted source; I is now tainted
-                        Value *v = dyn_cast<Value>(&I);
-                        addToSources(*v, name);
-                        errs() << I << " was not a constant; was tainted by " << *first << "\n";
-                    }
+    PRINT(I << " of function " << name << " is being identified\n");
 
-                } 
-            } else if (User->getOpcode() == Instruction::Call) {
-                // check if the variable is being modified by an untrusted sources
+    #ifdef ALLSOURCE
+    Value *v = dyn_cast<Value>(&I);
+    addToSources(*v, name);
+    return;
+    #endif
 
-                CallInst *call = dyn_cast<CallInst>(User);
-                if (call && (isSource(get_function_name(call)))) {
-                    std::string fn(get_function_name(call));
-                    errs() << "fn is " << fn << "\n";
-                    // if scanf functions any usage of I is tainted 
-                    if (!fn.compare("__isoc99_scanf") || !fn.compare("__isoc99_fscanf")) {
-                        Value *v = dyn_cast<Value>(&I);
-                        addToSources(*v, name);
+    // check all operands for tainted source calls
+    size_t operandNum = I.getNumOperands();
+    for (size_t i = 0; i < operandNum; i++) {
+        Value * op = I.getOperand(i);
+        CallInst *call = dyn_cast<CallInst>(op);
+        if (call && (isSource(get_function_name(call)))) {
+            // untrusted source; I is now tainted
+            Value *v = dyn_cast<Value>(&I);
+            addToSources(*v, name);
+            PRINT(I << " was tainted by " << *call << "\n");
+            foundSource = true;
+            break;
+        }
+    }
+
+    // if a source hasn't been found keep looking
+    if (!foundSource) {
+
+        // look for the values being stored to a I
+        for(Value::use_iterator UI = I.use_begin(), E = I.use_end(); UI != E; ++UI) {
+            Instruction *User = dyn_cast<Instruction>(*UI);
+            if(User) {
+                if (User->getOpcode() == Instruction::Store) {
+                    Value *first = User->getOperand(0);
+                    // if it's not a constant it's probably used as a source of input
+                    if (!dyn_cast<Constant>(first)) {
+                        Instruction *var = dyn_cast<Instruction>(first);
+                        if (!var) {
+                            // usually means it's a function argument; which are already added
+                            continue;
+                        }
                         
-                    } else {
+                        // if the the value of a call is being stored see if it's from untrusted sources
+                        CallInst *call = dyn_cast<CallInst>(var);
+                        if (call && (isSource(get_function_name(call)))) {
+                            Value *v = dyn_cast<Value>(&I);
+                            addToSources(*v, name);
+                            PRINT(I << " was not a constant; was tainted by " << *first << "\n");
+                            return;
+                        }
 
-                        // check and see if I is being used as a taintable operand in User
-                        int pos;
-                        bool found = false;
-                        int argc = isSourceOperand(get_function_name(call));
-                        int num = call->getNumArgOperands();
-                        for (pos = 0; pos < num; pos++) {
-                            Value *operand = call->getArgOperand(pos);
-                            if ((operand)->getValueID() == I.getValueID()) {
-                                found = true;
-                                pos++;
-                                break;
+                    } 
+                } else if (User->getOpcode() == Instruction::Call) {
+                    // check if the variable is being modified by an untrusted sources
+                    PRINT(I << " is used in call " << *User << "\n");
+
+                    CallInst *call = dyn_cast<CallInst>(User);
+                    if (call && (isSource(get_function_name(call)))) {
+                        std::string fn(get_function_name(call));
+
+                        // if it's scanf family functions any usage of I is possibly tainted 
+                        if (!fn.compare("__isoc99_scanf") || !fn.compare("__isoc99_fscanf")) {
+                            Value *v = dyn_cast<Value>(&I);
+                            addToSources(*v, name);
+                            break;
+                        } else {
+
+                            // check and see if I is being used as a taintable operand in the tainted source
+                            int pos;
+                            bool found = false;
+                            int argc = isSourceOperand(get_function_name(call));
+                            int num = call->getNumArgOperands();
+                            for (pos = 0; pos < num; pos++) {
+                                Value *operand = call->getArgOperand(pos);
+                                Value *ival = dyn_cast<Value>(&I);
+                                if (operand == ival) {
+                                    found = true;
+                                    // the arg value in the tainted sources structure is not 0 based
+                                    // increment pos to align with that
+                                    pos++;
+                                    break;
+                                }
+                            }
+
+                            // if we found tainted source and I was being used in a taintable spot
+                            // end loop and return
+                            if (found == true && pos == argc) {
+                                 Value *v = dyn_cast<Value>(&I);
+                                 addToSources(*v, name);
+                                 break;
                             }
                         }
-
-                        if (found == true && pos == argc) {
-                             Value *v = dyn_cast<Value>(&I);
-                             addToSources(*v, name);
-                        }
-
                     }
-                    errs() << I << " is used in call " << *User << "\n";
                 }
             }
         }
-    }   
+    }
 }
 
 void taint::identifySrcsAndSinks(Function * f) {
@@ -265,11 +296,11 @@ void taint::identifySrcsAndSinks(Function * f) {
                 if (call) {
                     if (!isSink(get_function_name(call)))
                         continue;
-                    errs() << *i << " is a sink call\n";
+                    PRINT(*i << " is a sink call\n");
                 } else if (ret) {
-                    errs() << *i << " is a return instruction\n";
+                    PRINT(*i << " is a return instruction\n");
                 } else if (br) {
-                    errs() << *i << " is a branch instruction\n";
+                    PRINT(*i << " is a branch instruction\n");
                 }
                 addToSinks(*i, name);
             } else {
@@ -345,6 +376,7 @@ void taint::taintTrack(Instruction &I) {
     tq.push_back(&I);
     while(!tq.empty()) {
         Instruction *node = tq.front();
+        PRINT(*node << " is examined\n");
         tq.pop_front();
 	if(node==NULL)
 		currPath.pop_back();
@@ -370,6 +402,7 @@ void taint::taintTrack(Instruction &I) {
 
         StoreInst *store = dyn_cast<StoreInst>(node);
         
+        // TODO: will need to be modified for global vars
         if (store) {
             Value *des = store->getOperand(1);
             Instruction *dest = dyn_cast<Instruction>(des);
@@ -386,11 +419,10 @@ void taint::taintTrack(Instruction &I) {
             }
         }
 
-        //errs() << *node << " is examined\n";
 		// analyze node 
 		if(sinkSearch(node, name)) {
 			// we found a sink
-			errs() << I << " has a path to " << *node << "\n";
+			PRINT(I << " has a path to " << *node << "\n");
             numPaths++;
 			for (std::list<Instruction*>::iterator it=currPath.begin(), et=currPath.end(); it!=et; it++)
 				taintedInstructions.insert(*it);
