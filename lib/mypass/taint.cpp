@@ -256,9 +256,7 @@ void taint::identifySrcsAndSinks(Function * f) {
     for (Function::iterator b = f->begin(); b != f->end(); b++) {
         for (BasicBlock::iterator i = b->begin(); i != b->end(); i++) { 
             // find variables that use non-constant values
-            if (i->getOpcode() == Instruction::Alloca || i->getOpcode() == Instruction::GetElementPtr) {
-                identifySource(*i);
-            } else if (i->getOpcode() == Instruction::Call || i->getOpcode() == Instruction::Ret || i->getOpcode() == Instruction::Br) {
+            if (i->getOpcode() == Instruction::Call || i->getOpcode() == Instruction::Ret || i->getOpcode() == Instruction::Br) {
                 // potentially a sink
                 CallInst *call = dyn_cast<CallInst>(i);
                 ReturnInst *ret = dyn_cast<ReturnInst>(i);
@@ -274,6 +272,8 @@ void taint::identifySrcsAndSinks(Function * f) {
                     errs() << *i << " is a branch instruction\n";
                 }
                 addToSinks(*i, name);
+            } else {
+                identifySource(*i);
             }
         }
     }
