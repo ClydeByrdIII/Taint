@@ -10,6 +10,9 @@
 #include <queue>
 #include <algorithm>
 
+#define UNTAINT
+#define ALLSOURCE
+
 // function name and # of which argument can be tainted
 // -1 if var args
 struct source {
@@ -123,7 +126,9 @@ namespace {
                 }
 
             }
-
+		// Count Insts that propagate taint
+		llvm::errs()<< "# Tainting Instructions = " << taintedInstructions.size() << "\n";
+		
             return false; // return true if you modified the code
         }
 
@@ -316,6 +321,45 @@ void taint::addToSinks(Value &I, std::string name) {
     }
 }
 
+void taint::taintTrack(Instruction &I) {
+    std::vector<Instruction *> taint;
+    std::list<Instruction *> tq;
+    std::list<Instruction *> currPath;
+    size_t tainted_vars = 0;
+    taint.push_back(&I);
+    tq.push(&I);
+    while(!tq.empty()) {
+        Instruction *node = tq.front();
+        tq.pop();
+	if(node==NULL)
+		currPath.pop_back();
+	else {
+		currPath.push_back(node);
+
+		tq.push_front(NULL);
+#ifdef UNTAINT
+		// Untaint constant stores
+		// TODO: Also conjuctions of untainted values
+		if (dyn_cast<StoreInst>(node))
+			if (dyn_cast<Constant>(node->getOperand(0)))
+				continue;
+#endif
+		// enqueue all children
+		for(Value::use_iterator UI = node->use_begin(), E = node->use_end(); UI != E; ++UI) {
+			Instruction *user = dyn_cast<Instruction>(*UI);
+			tq.push_front(user);
+		}
+
+		// analyze node 
+		if(sinkSearch(node)) {
+			// we found a sink
+			errs() << I << " has a path to " << *node << "\n";
+			for (std::iterator<Instruction*> it=currPath.begin(), et=currPath.end(); it!=et; it++)
+				taintedInstructions.push_back(*it);
+		}
+	}   
+    }
+}
 
 // return true if I is a sink
 bool taint::sinkSearch(Value *I, std::string fname) {
