@@ -8,10 +8,11 @@
 #include "llvm/Support/DataTypes.h"
 #include "llvm/Analysis/LoopPass.h"
 #include <queue>
+#include <set>
 #include <algorithm>
 
 #define UNTAINT
-#define ALLSOURCE
+// #define ALLSOURCE
 
 // function name and # of which argument can be tainted
 // -1 if var args
@@ -77,6 +78,7 @@ namespace {
         taint() : ModulePass(ID) { }
         virtual bool runOnModule(Module &M) {
             
+            numPaths = 0;
             /* TODO: ADD global instructions in to the analaysis */
             for (Module::global_iterator glob = M.global_begin(), globe = M.global_end(); glob != globe; glob++ ) {
                 errs() << "Global instruction: " << *glob << "\n";
@@ -122,12 +124,16 @@ namespace {
                 std::string fname = (*l)->getName().str();
                 for (std::vector<Value *>::iterator I = funcSrcs[fname].begin(), IE = funcSrcs[fname].end(); I != IE; I++ ) {
                     errs() << fname << " has " << **I << " as a source\n";
+                    Instruction *v = dyn_cast<Instruction>(*I);
+                    if (v)
+                        taintTrack(*v);
  
                 }
 
             }
 		// Count Insts that propagate taint
 		llvm::errs()<< "# Tainting Instructions = " << taintedInstructions.size() << "\n";
+        llvm::errs()<< "# of Paths = " << numPaths << "\n";
 		
             return false; // return true if you modified the code
         }
@@ -154,7 +160,8 @@ namespace {
         private:
             std::map<Instruction *, std::vector<Value *> > taintMap;
             std::queue<Instruction *> taintedQueue;
-            std::vector<Instruction *> taintedInstructions;
+            std::set<Instruction *> taintedInstructions;
+            size_t numPaths;
             std::map<std::string, Function *> funcMap;
             std::vector<Function *> funcRTP;
             std::vector<Function *> funcTP;
@@ -186,9 +193,15 @@ void taint::identifySource(Instruction &I) {
                         continue;
                     }
                     
+                    #ifdef ALLSOURCE
+                        Value *v = dyn_cast<Value>(&I);
+                        addToSources(*v, name);
+                        continue;
+                    #endif
+
                     // if the the value of a call is being stored see if it's from untrusted sources
                     CallInst *call = dyn_cast<CallInst>(var);
-                    if (call && (isSource(get_function_name(call)) || taintedFunctions[get_function_name(call)] != NULL)) {
+                    if (call && (isSource(get_function_name(call)))) {
                         // untrusted source; I is now tainted
                         Value *v = dyn_cast<Value>(&I);
                         addToSources(*v, name);
@@ -200,7 +213,7 @@ void taint::identifySource(Instruction &I) {
                 // check if the variable is being modified by an untrusted sources
 
                 CallInst *call = dyn_cast<CallInst>(User);
-                if (call && (isSource(get_function_name(call)) || taintedFunctions[get_function_name(call)] != NULL)) {
+                if (call && (isSource(get_function_name(call)))) {
                     std::string fn(get_function_name(call));
                     errs() << "fn is " << fn << "\n";
                     // if scanf functions any usage of I is tainted 
@@ -325,12 +338,14 @@ void taint::taintTrack(Instruction &I) {
     std::vector<Instruction *> taint;
     std::list<Instruction *> tq;
     std::list<Instruction *> currPath;
-    size_t tainted_vars = 0;
+    std::string name = I.getParent()->getParent()->getName().str();
+    std::set<Instruction*> dup;
+
     taint.push_back(&I);
-    tq.push(&I);
+    tq.push_back(&I);
     while(!tq.empty()) {
         Instruction *node = tq.front();
-        tq.pop();
+        tq.pop_front();
 	if(node==NULL)
 		currPath.pop_back();
 	else {
@@ -347,15 +362,38 @@ void taint::taintTrack(Instruction &I) {
 		// enqueue all children
 		for(Value::use_iterator UI = node->use_begin(), E = node->use_end(); UI != E; ++UI) {
 			Instruction *user = dyn_cast<Instruction>(*UI);
-			tq.push_front(user);
+            if (dup.find(user) == dup.end()){
+                tq.push_front(user);
+                dup.insert(user);
+            }
 		}
 
+        StoreInst *store = dyn_cast<StoreInst>(node);
+        
+        if (store) {
+            Value *des = store->getOperand(1);
+            Instruction *dest = dyn_cast<Instruction>(des);
+            if (dest) {
+                for(Value::use_iterator UI = dest->use_begin(), E = dest->use_end(); UI != E; ++UI) {
+                    Instruction *user = dyn_cast<Instruction>(*UI);
+                    if (user) {
+                        if (dup.find(user) == dup.end()){
+                            tq.push_front(user);
+                            dup.insert(user);
+                        }
+                    }
+                }
+            }
+        }
+
+        //errs() << *node << " is examined\n";
 		// analyze node 
-		if(sinkSearch(node)) {
+		if(sinkSearch(node, name)) {
 			// we found a sink
 			errs() << I << " has a path to " << *node << "\n";
-			for (std::iterator<Instruction*> it=currPath.begin(), et=currPath.end(); it!=et; it++)
-				taintedInstructions.push_back(*it);
+            numPaths++;
+			for (std::list<Instruction*>::iterator it=currPath.begin(), et=currPath.end(); it!=et; it++)
+				taintedInstructions.insert(*it);
 		}
 	}   
     }
