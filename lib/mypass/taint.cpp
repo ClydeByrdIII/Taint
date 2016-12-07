@@ -3,13 +3,17 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/Analysis/ProfileInfo.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Assembly/Writer.h"
+#include "llvm/Support/InstIterator.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/CFG.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/DataTypes.h"
-#include "llvm/Analysis/LoopPass.h"
 #include <queue>
 #include <set>
 #include <algorithm>
+
 
 
 #ifdef D
@@ -86,11 +90,15 @@ namespace {
         virtual bool runOnModule(Module &M) {
             
             numPaths = 0;
+            MustAlias = 0;
+            MayAlias = 0;
+            PartialAlias = 0;
+            NoAlias = 0;
             /* TODO: ADD global instructions in to the analaysis */
             for (Module::global_iterator glob = M.global_begin(), globe = M.global_end(); glob != globe; glob++ ) {
                 PRINT("Global instruction: " << *glob << "\n");
             }
-
+            AA = &getAnalysis<AliasAnalysis>();
             CG = &getAnalysis<CallGraph>();
             
             // find sources and sinks
@@ -115,7 +123,7 @@ namespace {
 
                 funcMap[name] = func;
                 funcTP.push_back(func);
-
+                pointerAnalysis(*func);
                 identifySrcsAndSinks(func);
             }
            
@@ -131,7 +139,6 @@ namespace {
                     Instruction *v = dyn_cast<Instruction>(*I);
                     if (v)
                         taintTrack(*v);
- 
                 }
 
             }
@@ -144,6 +151,8 @@ namespace {
 
         void getAnalysisUsage(AnalysisUsage &AU) const {
             AU.addRequired<CallGraph>(); 
+            AU.addRequired<AliasAnalysis>();
+            AU.setPreservesAll();
         }
 
         void taintTrack(Instruction &I);
@@ -161,15 +170,28 @@ namespace {
         int isSourceOperand(std::string str); 
         bool sinkSearch(Value * I, std::string fname);
 
+        void pointerAnalysis(Function &F);
+        void PrintResults(const char *Msg, bool P, const Value *V1,
+                         const Value *V2, const Module *M);
+
+        bool isInterestingPointer(Value *V);     
+
         private:
             size_t numPaths;
             CallGraph *CG;  // shows topological ordering of functions
+            AliasAnalysis *AA;
             std::vector<Function *> funcTP;  // topological ordering of functions; used to reverse ordering
             std::vector<Function *> funcRTP; // reverse topological ordering of functions
             std::map<std::string, Function *> funcMap;
             std::set<Instruction *> taintedInstructions;
+            std::map<Value*, std::set<Value *> > ptr2Set;
             std::map<std::string, std::vector<Value *> > funcSrcs;
             std::map<std::string, std::vector<Value *> > funcSinks;
+
+            size_t MustAlias ;
+            size_t MayAlias ;
+            size_t PartialAlias;
+            size_t NoAlias;
 
     };
 }
@@ -400,6 +422,22 @@ void taint::taintTrack(Instruction &I) {
             }
 		}
 
+        // enqueue all aliases
+
+        if (node->getType()->isPointerTy())  {// Add all pointer instructions.
+            Value *v = dyn_cast<Value>(&(*node));
+            for (std::set<Value*>::iterator it = ptr2Set[v].begin(), ite = ptr2Set[v].end(); it != ite; it++) {
+                Instruction* inst = dyn_cast<Instruction>(*it);
+                if (inst) {
+                    if (dup.find(inst) == dup.end()){
+                        PRINT(*v << " aliases " << **it << "\n");
+                        tq.push_front(inst);
+                        dup.insert(inst);
+                    }
+                }
+            }
+        }
+
         StoreInst *store = dyn_cast<StoreInst>(node);
         
         // TODO: will need to be modified for global vars
@@ -440,3 +478,92 @@ bool taint::sinkSearch(Value *I, std::string fname) {
     }
     return false;
 }
+
+void taint::pointerAnalysis(Function &F) {
+    SetVector<Value *> Pointers;
+    SetVector<CallSite> CallSites;
+
+    for (Function::arg_iterator I = F.arg_begin(), E = F.arg_end(); I != E; ++I)
+      if (I->getType()->isPointerTy())    // Add all pointer arguments.
+        Pointers.insert(I);
+
+    for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
+      if (I->getType()->isPointerTy()) // Add all pointer instructions.
+        Pointers.insert(&*I);
+      Instruction &Inst = *I;
+      if (CallSite CS = cast<Value>(&Inst)) {
+        Value *Callee = CS.getCalledValue();
+        // Skip actual functions for direct function calls.
+        if (!isa<Function>(Callee) && isInterestingPointer(Callee))
+          Pointers.insert(Callee);
+        // Consider formals.
+        for (CallSite::arg_iterator AI = CS.arg_begin(), AE = CS.arg_end();
+             AI != AE; ++AI)
+          if (isInterestingPointer(*AI))
+            Pointers.insert(*AI);
+        CallSites.insert(CS);
+      } else {
+        // Consider all operands.
+        for (Instruction::op_iterator OI = Inst.op_begin(), OE = Inst.op_end();
+             OI != OE; ++OI)
+          if (isInterestingPointer(*OI))
+            Pointers.insert(*OI);
+      }
+    }
+
+    // iterate over the worklist, and run the full (n^2)/2 disambiguations
+    for (SetVector<Value *>::iterator I1 = Pointers.begin(), E = Pointers.end();
+         I1 != E; ++I1) {
+        uint64_t I1Size = AliasAnalysis::UnknownSize;
+        Type *I1ElTy = cast<PointerType>((*I1)->getType())->getElementType();
+        if (I1ElTy->isSized()) I1Size = AA->getTypeStoreSize(I1ElTy);
+
+        for (SetVector<Value *>::iterator I2 = Pointers.begin(); I2 != I1; ++I2) {
+            uint64_t I2Size = AliasAnalysis::UnknownSize;
+            Type *I2ElTy =cast<PointerType>((*I2)->getType())->getElementType();
+            if (I2ElTy->isSized()) I2Size = AA->getTypeStoreSize(I2ElTy);
+
+            switch (AA->alias(*I1, I1Size, *I2, I2Size)) {
+            case AliasAnalysis::NoAlias:
+                ++NoAlias; break;
+            case AliasAnalysis::MayAlias:
+                ptr2Set[*I1].insert(*I2);
+                ptr2Set[*I2].insert(*I1);
+                ++MayAlias; break;
+            case AliasAnalysis::PartialAlias:
+                ptr2Set[*I1].insert(*I2);
+                ptr2Set[*I2].insert(*I1);
+                ++PartialAlias; break;
+            case AliasAnalysis::MustAlias:
+                ptr2Set[*I1].insert(*I2);
+                ptr2Set[*I2].insert(*I1);
+                ++MustAlias; break;
+            }
+        }
+    }
+}
+
+void taint::PrintResults(const char *Msg, bool P, const Value *V1,
+                         const Value *V2, const Module *M) {
+  if (P) {
+    std::string o1, o2;
+    {
+      raw_string_ostream os1(o1), os2(o2);
+      WriteAsOperand(os1, V1, true, M);
+      WriteAsOperand(os2, V2, true, M);
+    }
+    
+    if (o2 < o1)
+      std::swap(o1, o2);
+    errs() << "  " << Msg << ":\t"
+           << o1 << ", "
+           << o2 << "\n";
+  }
+}
+
+bool taint::isInterestingPointer(Value *V)
+ {
+  return V->getType()->isPointerTy()
+      && !isa<ConstantPointerNull>(V);
+}
+

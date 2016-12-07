@@ -10,4 +10,4 @@ llc $fname.profile.ls.bc -o $fname.profile.ls.s
 g++ -o $fname.profile $fname.profile.ls.s /opt/llvm/Release+Asserts/lib/libprofile_rt.so
 ./$fname.profile $2 $3 $4
 
-opt -load Release+Asserts/lib/mypass.so -profile-loader -profile-info-file=llvmprof.out -taint < $fname.ls.bc > /dev/null || { echo "Failed to opt-load"; exit 1; }
+opt -load Release+Asserts/lib/mypass.so -profile-loader -profile-info-file=llvmprof.out -basicaa -aa-eval -taint < $fname.ls.bc > /dev/null || { echo "Failed to opt-load"; exit 1; }
