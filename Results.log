@@ -1,0 +1,63 @@
+>>> ALL SOURCE
+
+---mcf.preopt.c---
+# Instructions = 1957
+# Used = 8.983137e-01
+# Tainting Instructions = 1362
+# Tainting Paths = 6219
+# Invariants = 111
+Counts: 6185 , 4176
+# Optimistic Checks = 397
+# Type One Checks = 296
+
+---minigzip.preopt.c---
+# Instructions = 11068
+# Used = 4.184134e-01
+# Tainting Instructions = 8200
+# Tainting Paths = 241822
+# Invariants = 4976
+Counts: 55944721 , 64758215
+# Optimistic Checks = 6362
+# Type One Checks = 5985
+
+---bzip2.preopt.c---
+# Instructions = 12976
+# Used = 8.271424e-01
+# Tainting Instructions = 9692
+# Tainting Paths = 621033
+# Invariants = 1564
+Counts: 6194230 , 4212384
+# Optimistic Checks = 7206
+# Type One Checks = 6524
+
+>>> SEED SOURCE
+---mcf.preopt.c---
+# Instructions = 1957
+# Used = 8.983137e-01
+# Tainting Instructions = 29
+# Tainting Paths = 10
+# Invariants = 0
+Counts: 0 , 0
+# Optimistic Checks = 0
+# Type One Checks = 0
+
+---minigzip.preopt.c ---
+# Instructions = 11068
+# Used = 4.184134e-01
+# Tainting Instructions = 26
+# Tainting Paths = 15
+# Invariants = 17
+Counts: 114 , 84
+# Optimistic Checks = 17
+# Type One Checks = 17
+
+---bzip2.preopt.c---
+# Instructions = 12976
+# Used = 8.271424e-01
+# Tainting Instructions = 16
+# Tainting Paths = 10
+# Invariants = 4
+Counts: 22 , 18
+# Optimistic Checks = 9
+# Type One Checks = 8
+
