@@ -59,6 +59,11 @@ namespace {
             /* TODO: ADD global instructions in to the analaysis */
             for (Module::global_iterator glob = M.global_begin(), globe = M.global_end(); glob != globe; glob++ ) {
                 PRINT("Global instruction: " << *glob << "\n");
+
+                if (glob->isConstant())
+                    continue;
+
+                identifySource(*glob);
             }
 
             // read in source, sink, taint configuration files
@@ -123,6 +128,7 @@ namespace {
         void identifySrcsAndSinks(Function *);
         
         void identifySource(Instruction &I);
+        void identifySource(GlobalVariable &I);
         
         bool isSink(std::string str);
         bool isSource(std::string str);
@@ -410,6 +416,102 @@ void taint::identifySource(Instruction &I) {
     }
 }
 
+void taint::identifySource(GlobalVariable &I) {
+
+    Function *f;
+    // PRINT(I << " of function " << name << " is being identified\n");
+
+    #ifdef ALLSOURCE
+
+    for(Value::use_iterator UI = I.use_begin(), E = I.use_end(); UI != E; ++UI) {
+        Instruction *User = dyn_cast<Instruction>(*UI);
+        if(User) {
+            Value *v = dyn_cast<Value>(&I);
+            f = User->getParent()->getParent();
+            std::string name = f->getName().str();
+            addToSources(*v, name);
+        }
+    }
+
+    return;
+    #endif
+
+    // look for the values being stored to a I
+    for(Value::use_iterator UI = I.use_begin(), E = I.use_end(); UI != E; ++UI) {
+        Instruction *User = dyn_cast<Instruction>(*UI);
+        if(User) {
+            if (User->getOpcode() == Instruction::Store) {
+                Value *first = User->getOperand(0);
+                // if it's not a constant it's probably used as a source of input
+                if (!dyn_cast<Constant>(first)) {
+                    Instruction *var = dyn_cast<Instruction>(first);
+                    if (!var) {
+                        // usually means it's a function argument; which are already added
+                        continue;
+                    }
+
+                    // if the the value of a call is being stored see if it's from untrusted sources
+                    CallInst *call = dyn_cast<CallInst>(var);
+                    if (call && (isSource(get_function_name(call)))) {
+                        Value *v = dyn_cast<Value>(&I);
+                        f = User->getParent()->getParent();
+                        std::string name = f->getName().str();
+                        addToSources(*v, name);
+                        PRINT(I << " was not a constant; was tainted by " << *first << "\n");
+                        return;
+                    }
+
+                }
+            } else if (User->getOpcode() == Instruction::Call) {
+                // check if the variable is being modified by an untrusted sources
+                PRINT(I << " is used in call " << *User << "\n");
+
+                CallInst *call = dyn_cast<CallInst>(User);
+                if (call && (isSource(get_function_name(call)))) {
+                    std::string fn(get_function_name(call));
+
+                    // if it's scanf family functions any usage of I is possibly tainted
+                    if (!fn.compare("__isoc99_scanf") || !fn.compare("__isoc99_fscanf")) {
+                        Value *v = dyn_cast<Value>(&I);
+                        f = User->getParent()->getParent();
+                        std::string name = f->getName().str();
+                        addToSources(*v, name);
+                        break;
+                    } else {
+
+                        // check and see if I is being used as a taintable operand in the tainted source
+                        int pos;
+                        bool found = false;
+                        int argc = getSourceOperand(get_function_name(call));
+                        int num = call->getNumArgOperands();
+                        for (pos = 0; pos < num; pos++) {
+                            Value *operand = call->getArgOperand(pos);
+                            Value *ival = dyn_cast<Value>(&I);
+                            if (operand == ival) {
+                                found = true;
+                                // the arg value in the tainted sources structure is not 0 based
+                                // increment pos to align with that
+                                pos++;
+                                break;
+                            }
+                        }
+
+                        // if we found tainted source and I was being used in a taintable spot
+                        // end loop and return
+                        if (found == true && pos == argc) {
+                             Value *v = dyn_cast<Value>(&I);
+                             f = User->getParent()->getParent();
+                             std::string name = f->getName().str();
+                             addToSources(*v, name);
+                             break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void taint::identifySrcsAndSinks(Function * f) {
     std::string name = f->getName().str();
 
@@ -538,12 +640,22 @@ void taint::taintTrack(Instruction &I) {
 		currPath.push_back(node);
 
 		tq.push_front(NULL);
+
 #ifdef UNTAINT
 		// Untaint constant stores
 		// TODO: Also conjuctions of untainted values
-		if (dyn_cast<StoreInst>(node))
-			if (dyn_cast<Constant>(node->getOperand(0)))
+		if (dyn_cast<StoreInst>(node)) {
+            // globalvariables need to be tested for constant values seperately
+            GlobalVariable *g = dyn_cast<GlobalVariable>(node->getOperand(0));
+            if (g) {
+                if (g->isConstant()) {
+                    continue;
+                }
+            } else if (dyn_cast<Constant>(node->getOperand(0))) {
 				continue;
+            }
+        }
+
 
         bool untainted = false;
         // check if it's untainted via an untaint call
@@ -563,6 +675,7 @@ void taint::taintTrack(Instruction &I) {
             continue;
         }
 #endif
+
 		// enqueue all children
 		for(Value::use_iterator UI = node->use_begin(), E = node->use_end(); UI != E; ++UI) {
 			Instruction *user = dyn_cast<Instruction>(*UI);
@@ -592,12 +705,31 @@ void taint::taintTrack(Instruction &I) {
         
         // TODO: will need to be modified for global vars
         if (store) {
+
             Value *des = store->getOperand(1);
             Instruction *dest = dyn_cast<Instruction>(des);
             if (dest) {
                 for(Value::use_iterator UI = dest->use_begin(), E = dest->use_end(); UI != E; ++UI) {
                     Instruction *user = dyn_cast<Instruction>(*UI);
                     if (user) {
+                        if (dup.find(user) == dup.end()){
+                            tq.push_front(user);
+                            dup.insert(user);
+                        }
+                    }
+                }
+            }
+
+            GlobalVariable *gdest = dyn_cast<GlobalVariable>(des);
+
+            // if it's a global variable
+            if (gdest) {
+                for(Value::use_iterator UI = gdest->use_begin(), E = gdest->use_end(); UI != E; ++UI) {
+                    Instruction *user = dyn_cast<Instruction>(*UI);
+                    if (user) {
+                        // make sure to only add uses of the global variable in the same function
+                        if (user->getParent()->getParent() != store->getParent()->getParent())
+                            continue;
                         if (dup.find(user) == dup.end()){
                             tq.push_front(user);
                             dup.insert(user);
