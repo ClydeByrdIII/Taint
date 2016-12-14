@@ -142,6 +142,10 @@ namespace {
         void processSink(std::string line);
         void processUntaint(std::string line);
 
+        bool isUntaint(std::string str);
+        int getUntaintOperand(std::string str);
+        bool isUntaintOperand(Instruction *I, Instruction *user);
+
         private:
             size_t numPaths;
             CallGraph *CG;  // shows topological ordering of functions
@@ -468,12 +472,36 @@ bool taint::isSource(std::string str) {
     return false;
 }
 
+// compare with list of all untaint calls
+bool taint::isUntaint(std::string str) {
+    size_t i;
+    size_t len = untaints.size();
+
+    for (i = 0; i < len; i++) {
+        if (!(untaints[i].name.compare(str))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int taint::getSourceOperand(std::string str) {
     size_t i;
     size_t len = sources.size();
     for (i = 0; i < len; i++) {
         if (!(sources[i].name.compare(str))) {
             return sources[i].argc;
+        }
+    }
+    return -1;
+}
+
+int taint::getUntaintOperand(std::string str) {
+    size_t i;
+    size_t len = untaints.size();
+    for (i = 0; i < len; i++) {
+        if (!(untaints[i].name.compare(str))) {
+            return untaints[i].argc;
         }
     }
     return -1;
@@ -516,6 +544,24 @@ void taint::taintTrack(Instruction &I) {
 		if (dyn_cast<StoreInst>(node))
 			if (dyn_cast<Constant>(node->getOperand(0)))
 				continue;
+
+        bool untainted = false;
+        // check if it's untainted via an untaint call
+        for(Value::use_iterator UI = node->use_begin(), E = node->use_end(); UI != E; ++UI) {
+            Instruction *user = dyn_cast<Instruction>(*UI);
+            if (user) {
+                if (dyn_cast<CallInst>(user)) {
+                    if (isUntaintOperand(node, user)) {
+                        untainted = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (untainted) {
+            continue;
+        }
 #endif
 		// enqueue all children
 		for(Value::use_iterator UI = node->use_begin(), E = node->use_end(); UI != E; ++UI) {
@@ -653,3 +699,29 @@ bool taint::isInterestingPointer(Value *V)
       && !isa<ConstantPointerNull>(V);
 }
 
+bool taint::isUntaintOperand(Instruction *I, Instruction *user) {
+    bool ret = false;
+    CallInst *call = dyn_cast<CallInst>(user);
+    if (call && (isUntaint(get_function_name(call)))) {
+        std::string fn(get_function_name(call));
+        // check and see if I is being used as an untaintableOperand
+        int pos;
+        int argc = getUntaintOperand(get_function_name(call));
+        int num = call->getNumArgOperands();
+        for (pos = 0; pos < num; pos++) {
+            Value *operand = call->getArgOperand(pos);
+            Value *ival = dyn_cast<Value>(I);
+            if (operand == ival) {
+                // the arg value in the untainted sources structure is not 0 based
+                // increment pos to align with that
+                pos++;
+                break;
+            }
+        }
+
+        if (pos == argc) {
+            ret = true;
+        }
+    }
+    return ret;
+}
