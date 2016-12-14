@@ -4,7 +4,6 @@
 #include "llvm/Analysis/ProfileInfo.h"
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/Assembly/Writer.h"
 #include "llvm/Support/InstIterator.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/CFG.h"
@@ -13,9 +12,13 @@
 #include <queue>
 #include <set>
 #include <algorithm>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <sstream>
+#include <vector>
 
-
-
+// #define D
 #ifdef D
 #define PRINT(x) llvm::errs() << x
 #else
@@ -23,7 +26,11 @@
 #endif
 
 #define UNTAINT
-// #define ALLSOURCE
+#define ALLSOURCE
+
+#define SOURCE_CONFIG_FILE "src.cfg"
+#define SINK_CONFIG_FILE "sink.cfg"
+#define UNTAINT_CONFIG_FILE "untaint.cfg"
 
 // function name and # of which argument can be tainted
 // -1 if var args
@@ -31,55 +38,6 @@ struct source {
     std::string name;
     int argc;
 };
-
-struct source srcs[] =
-{
-    {"getchar", 0},
-    {"read", 2},
-    {"pread", 2},
-    {"fread", 1},
-    {"scanf", -1},
-    {"__isoc99_scanf", -1},
-    {"__isoc99_fscanf", -1},
-    {"fscanf", -1},
-    {"fgetc", 1},
-    {"gets", 1},
-    {"getc", 0},
-    {"fgets", 1},
-    {"fopen", 0},
-    {"freopen", 0},
-    {"recv", 2},
-    {"recvfrom", 2},
-};
-
-struct source sinks[] =
-{
-    {"strcpy", 2},
-    {"strncpy", 2},
-    {"strcat", 2},
-    {"strncat", 2},
-    {"strdup", 1},
-    {"memcpy", 2},
-    {"memmove", 2},
-    {"putc", 1},
-    {"putchar", 1},
-    {"fputc", 1},
-    {"puts", 1},
-    {"fputs", 2},
-    {"printf", -1},
-    {"fprintf", -1},
-    {"sprintf",  1},
-    {"snprintf", 1},
-    {"vfprintf", 1},
-    {"vsnprintf", 1},
-    {"vsprintf", 1},
-    {"write", 2},
-    {"fwrite", 1},
-    {"pwrite", 2},
-    {"send", 2},
-    {"sendto", 2},
-};
-
 
 using namespace llvm;
 
@@ -94,13 +52,18 @@ namespace {
             MayAlias = 0;
             PartialAlias = 0;
             NoAlias = 0;
+            
+            AA = &getAnalysis<AliasAnalysis>();
+            CG = &getAnalysis<CallGraph>();
+
             /* TODO: ADD global instructions in to the analaysis */
             for (Module::global_iterator glob = M.global_begin(), globe = M.global_end(); glob != globe; glob++ ) {
                 PRINT("Global instruction: " << *glob << "\n");
             }
-            AA = &getAnalysis<AliasAnalysis>();
-            CG = &getAnalysis<CallGraph>();
-            
+
+            // read in source, sink, taint configuration files
+            readConfigs();
+
             // find sources and sinks
             for (CallGraph::iterator i = CG->begin(), ie = CG->end(); i != ie; i++) {
                 Function *func = const_cast<Function *>(i->first);
@@ -167,14 +130,17 @@ namespace {
         void addToSinks(Value &I, std::string name);
 
         std::string get_function_name(CallInst *call);
-        int isSourceOperand(std::string str); 
+        int getSourceOperand(std::string str); 
         bool sinkSearch(Value * I, std::string fname);
 
         void pointerAnalysis(Function &F);
-        void PrintResults(const char *Msg, bool P, const Value *V1,
-                         const Value *V2, const Module *M);
 
-        bool isInterestingPointer(Value *V);     
+        bool isInterestingPointer(Value *V);
+
+        void readConfigs(void);
+        void processSource(std::string line);
+        void processSink(std::string line);
+        void processUntaint(std::string line);
 
         private:
             size_t numPaths;
@@ -182,6 +148,9 @@ namespace {
             AliasAnalysis *AA;
             std::vector<Function *> funcTP;  // topological ordering of functions; used to reverse ordering
             std::vector<Function *> funcRTP; // reverse topological ordering of functions
+            std::vector<struct source> sinks;
+            std::vector<struct source> sources;
+            std::vector<struct source> untaints;
             std::map<std::string, Function *> funcMap;
             std::set<Instruction *> taintedInstructions;
             std::map<Value*, std::set<Value *> > ptr2Set;
@@ -199,6 +168,140 @@ char taint::ID = 0;
 static RegisterPass<taint> X("taint", "Static Taint Analysis", false, false);
 
 // If an instance of I being tainted is found, add it to sources and return
+
+static void split(const std::string &s, char delim, std::vector<std::string> &elems) {
+    std::stringstream ss;
+    ss.str(s);
+    std::string item;
+    while (std::getline(ss, item, delim)) {
+        elems.push_back(item);
+    }
+}
+
+
+static std::vector<std::string> split(const std::string &s, char delim) {
+    std::vector<std::string> elems;
+    split(s, delim, elems);
+    return elems;
+}
+
+void taint::processSource(std::string line) {
+    std::vector<std::string> srcs;
+    struct source src;
+
+    srcs = split(line, ',');
+
+    if (srcs.empty())
+        return;
+
+    if (srcs.size() == 2) {
+        src.name = srcs[0];
+        std::istringstream istr(srcs[1]);
+
+        istr >> src.argc;
+        sources.push_back(src);
+        // Print("Source " << src.name << " tainting operand " << src.argc << "\n");
+    }
+}
+
+void taint::processSink(std::string line) {
+    std::vector<std::string> snks;
+    struct source sink;
+
+    snks = split(line, ',');
+
+    if (snks.empty())
+        return;
+
+    if (snks.size() == 2) {
+        sink.name = snks[0];
+        std::istringstream istr(snks[1]);
+
+        istr >> sink.argc;
+        sinks.push_back(sink);
+        // Print("Sink " << sink.name << " tainted operand " << sink.argc << "\n");
+    }
+}
+
+void taint::processUntaint(std::string line) {
+    std::vector<std::string> untnts;
+    struct source untaint;
+
+    untnts = split(line, ',');
+
+    if (untnts.empty())
+        return;
+
+    if (untnts.size() == 2) {
+        untaint.name = untnts[0];
+        std::istringstream istr(untnts[1]);
+
+        istr >> untaint.argc;
+        untaints.push_back(untaint);
+        // Print("Untaint " << untaint.name << " untainting operand " << untaint.argc << "\n");
+    }
+}
+
+void taint::readConfigs(void) {
+    std::ifstream srcFile;
+    std::ifstream sinkFile;
+    std::ifstream untaintFile;
+    std::string line;
+
+    // SOURCE list
+    srcFile.open(SOURCE_CONFIG_FILE);
+
+    PRINT("Source\n");
+
+    if (!srcFile.is_open()) {
+        PRINT("Error while opening " SOURCE_CONFIG_FILE " \n");
+    } else {
+        while(getline(srcFile, line)) {
+            processSource(line);
+        }
+    }
+
+    if (srcFile.bad()) {
+        PRINT("Error Reading " SOURCE_CONFIG_FILE "\n");
+    }
+
+    srcFile.close();
+
+    // Sink List
+    sinkFile.open(SINK_CONFIG_FILE);
+
+    if (!sinkFile.is_open()) {
+        PRINT("Error while opening " SINK_CONFIG_FILE "\n");
+    } else {
+        while(getline(sinkFile, line)) {
+            processSink(line);
+        }
+    }
+
+    if (sinkFile.bad()) {
+       PRINT("Error Reading " SINK_CONFIG_FILE " \n");
+    }
+
+    sinkFile.close();
+
+    // Untaint List
+    untaintFile.open(UNTAINT_CONFIG_FILE);
+
+    if (!untaintFile.is_open()) {
+        PRINT("Error while opening " UNTAINT_CONFIG_FILE "\n");
+    } else {
+        while(getline(untaintFile, line)) {
+            processUntaint(line);
+        }
+    }
+
+    if (untaintFile.bad()) {
+        PRINT("Error Reading " UNTAINT_CONFIG_FILE "\n");
+    }
+
+    untaintFile.close();
+
+}
 
 void taint::identifySource(Instruction &I) {
 
@@ -274,7 +377,7 @@ void taint::identifySource(Instruction &I) {
                             // check and see if I is being used as a taintable operand in the tainted source
                             int pos;
                             bool found = false;
-                            int argc = isSourceOperand(get_function_name(call));
+                            int argc = getSourceOperand(get_function_name(call));
                             int num = call->getNumArgOperands();
                             for (pos = 0; pos < num; pos++) {
                                 Value *operand = call->getArgOperand(pos);
@@ -343,7 +446,7 @@ std::string taint::get_function_name(CallInst *call) {
 // compare with list of all sinks
 bool taint::isSink(std::string str) {
     size_t i;
-    size_t len = *(&sinks + 1) - sinks;
+    size_t len = sinks.size();
     for (i = 0; i < len; i++) {
         if (!(sinks[i].name.compare(str))) {
             return true;
@@ -355,21 +458,22 @@ bool taint::isSink(std::string str) {
 // compare with list of all sources
 bool taint::isSource(std::string str) {
     size_t i;
-    size_t len = *(&srcs + 1) - srcs;
+    size_t len = sources.size();
+
     for (i = 0; i < len; i++) {
-        if (!(srcs[i].name.compare(str))) {
+        if (!(sources[i].name.compare(str))) {
             return true;
         }
     }
     return false;
 }
 
-int taint::isSourceOperand(std::string str) {
+int taint::getSourceOperand(std::string str) {
     size_t i;
-    size_t len = *(&srcs + 1) - srcs;
+    size_t len = sources.size();
     for (i = 0; i < len; i++) {
-        if (!(srcs[i].name.compare(str))) {
-            return srcs[i].argc;
+        if (!(sources[i].name.compare(str))) {
+            return sources[i].argc;
         }
     }
     return -1;
@@ -541,24 +645,6 @@ void taint::pointerAnalysis(Function &F) {
             }
         }
     }
-}
-
-void taint::PrintResults(const char *Msg, bool P, const Value *V1,
-                         const Value *V2, const Module *M) {
-  if (P) {
-    std::string o1, o2;
-    {
-      raw_string_ostream os1(o1), os2(o2);
-      WriteAsOperand(os1, V1, true, M);
-      WriteAsOperand(os2, V2, true, M);
-    }
-    
-    if (o2 < o1)
-      std::swap(o1, o2);
-    errs() << "  " << Msg << ":\t"
-           << o1 << ", "
-           << o2 << "\n";
-  }
 }
 
 bool taint::isInterestingPointer(Value *V)
